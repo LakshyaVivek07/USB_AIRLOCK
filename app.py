@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -115,6 +116,7 @@ def explain(level, reasons, clam_ran):
 # ----------------------------------------------------------------------------
 _lock = threading.Lock()          # protects the audit log and approvals
 _scan_lock = threading.Lock()     # only one scan at a time
+JOBS = {}                         # background scans, by job id (progress + cancel flag)
 SCAN_ID_RE = re.compile(r"^\d{8}-\d{6}-[a-f0-9]{6}$")
 
 
@@ -173,67 +175,117 @@ def clamav_version():
         return None
 
 
-def run_clamscan(folder: Path):
-    """Scan a whole folder in ONE call (ClamAV takes ~10-20s just to load its
-    database, so we never call it once per file).
-    Returns (status, message, {absolute_path: signature})."""
-    try:
-        r = subprocess.run(
-            ["clamscan", "-r", "--no-summary", str(folder)],
-            capture_output=True, text=True, timeout=CLAMSCAN_TIMEOUT,
-        )
-    except FileNotFoundError:
-        return "unavailable", "ClamAV (clamscan) is not installed.", {}
-    except subprocess.TimeoutExpired:
-        return "error", "ClamAV timed out.", {}
+class ScanCancelled(Exception):
+    """Raised when the user presses Cancel during a scan."""
 
-    found = {}
-    for line in r.stdout.splitlines():
+
+def run_clamscan(folder: Path, job=None):
+    """Scan a whole folder in ONE call (ClamAV takes ~10-20s just to load its
+    database, so we never call it once per file). We read its output line by
+    line, which lets the dashboard show progress and lets the user cancel.
+    Returns (status, message, {absolute_path: signature})."""
+    if not shutil.which("clamscan"):
+        return "unavailable", "ClamAV (clamscan) is not installed.", {}
+    cmd = ["clamscan", "-r", "--no-summary", str(folder)]
+    if shutil.which("stdbuf"):
+        cmd = ["stdbuf", "-oL"] + cmd              # line-buffered, so progress is live
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, errors="replace")
+    state = {"timed_out": False}
+
+    def watchdog():                                 # enforces timeout + cancel
+        started = time.time()
+        while proc.poll() is None:
+            if job is not None and job["cancel"]:
+                proc.terminate()
+                return
+            if time.time() - started > CLAMSCAN_TIMEOUT:
+                state["timed_out"] = True
+                proc.kill()
+                return
+            time.sleep(0.3)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    found, tail = {}, []
+    for line in proc.stdout:
+        line = line.rstrip("\n")
         if line.endswith(" FOUND"):
             path, _, rest = line.rpartition(": ")
             found[path] = rest[: -len(" FOUND")]
-    if r.returncode in (0, 1):                       # 0 = clean, 1 = threats found
+        tail = (tail + [line])[-5:]
+        if job is not None and (line.endswith(": OK") or line.endswith(" FOUND")
+                                or line.endswith(": Empty file")):
+            job["scanned"] += 1                     # one more file checked
+    proc.wait()
+
+    if job is not None and job["cancel"]:
+        return "cancelled", "Scan cancelled.", found
+    if state["timed_out"]:
+        return "error", "ClamAV timed out.", found
+    if proc.returncode in (0, 1):                   # 0 = clean, 1 = threats found
         return "ok", "ClamAV scan completed.", found
-    return "error", (r.stderr.strip() or r.stdout.strip() or "ClamAV failed.")[:300], found
+    return "error", ("\n".join(tail) or "ClamAV failed.")[:300], found
 
 
 # ----------------------------------------------------------------------------
 # 5. THE PIPELINE - USB folder -> quarantine copy -> hash -> ClamAV -> score
 # ----------------------------------------------------------------------------
-def run_scan(source: Path):
+def run_scan(source: Path, job=None):
+    """The whole pipeline. `job` is optional: when the dashboard starts a scan in
+    the background we pass a dict that we keep updating with progress, and we
+    watch it for a cancel request."""
     scan_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     qdir = QUARANTINE / scan_id
     qdir.mkdir(parents=True)
     audit("SCAN_STARTED", f"Scan {scan_id} started on {source}", scan_id=scan_id)
 
-    # --- Step A: copy into quarantine (read-only use of the USB) ------------
-    records = []
+    def check_cancel():
+        if job is not None and job["cancel"]:
+            shutil.rmtree(qdir, ignore_errors=True)         # nothing half-scanned is kept
+            audit("SCAN_CANCELLED", f"Scan {scan_id} cancelled by the user; quarantine copy deleted",
+                  scan_id=scan_id)
+            raise ScanCancelled()
+
+    # --- Step A: list the files (so we know the total), then copy them -------
+    todo = []
     for root, _dirs, names in os.walk(source, followlinks=False):
         for name in sorted(names):
-            src = Path(root) / name
-            rel = src.relative_to(source)
-            rec = {"name": name, "rel_path": str(rel), "ext": src.suffix.lower(),
-                   "size": 0, "sha256": None, "status": "quarantined", "note": None}
-            try:
-                if src.is_symlink():
-                    rec.update(status="skipped", note="Symbolic link skipped (could point at the host system).")
+            todo.append(Path(root) / name)
+    if job is not None:
+        job.update(total=len(todo), phase="copying")
+
+    records = []
+    for src in todo:
+        check_cancel()
+        rel = src.relative_to(source)
+        rec = {"name": src.name, "rel_path": str(rel), "ext": src.suffix.lower(),
+               "size": 0, "sha256": None, "status": "quarantined", "note": None}
+        try:
+            if src.is_symlink():
+                rec.update(status="skipped", note="Symbolic link skipped (could point at the host system).")
+            else:
+                size = src.stat().st_size
+                rec["size"] = size
+                if size > MAX_FILE_MB * 1024 * 1024:
+                    rec.update(status="skipped", note=f"Larger than {MAX_FILE_MB} MB, not scanned.")
                 else:
-                    size = src.stat().st_size
-                    rec["size"] = size
-                    if size > MAX_FILE_MB * 1024 * 1024:
-                        rec.update(status="skipped", note=f"Larger than {MAX_FILE_MB} MB, not scanned.")
-                    else:
-                        dest = qdir / rel
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copyfile(src, dest)      # copies data only, never runs it
-                        os.chmod(dest, 0o600)           # no execute bit, owner-only
-                        rec["sha256"] = sha256_of(dest)
-            except OSError as e:
-                rec.update(status="skipped", note=f"Could not read file: {e.strerror}")
-            records.append(rec)
+                    dest = qdir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(src, dest)      # copies data only, never runs it
+                    os.chmod(dest, 0o600)           # no execute bit, owner-only
+                    rec["sha256"] = sha256_of(dest)
+        except OSError as e:
+            rec.update(status="skipped", note=f"Could not read file: {e.strerror}")
+        records.append(rec)
+        if job is not None:
+            job["copied"] += 1
 
     # --- Step B: ClamAV on the quarantine copy -------------------------------
-    clam_status, clam_msg, found = run_clamscan(qdir)
+    if job is not None:
+        job["phase"] = "scanning"
+    clam_status, clam_msg, found = run_clamscan(qdir, job)
+    check_cancel()
     clam_ran = clam_status == "ok"
 
     # --- Step C: score every file --------------------------------------------
@@ -290,8 +342,8 @@ def health():
                     "clamav": {"available": v is not None, "version": v}})
 
 
-@app.get("/api/devices")
-def devices():
+def list_removable_devices():
+    """Real removable drives that Ubuntu has mounted right now (uses `lsblk`)."""
     found = []
     try:
         out = subprocess.run(["lsblk", "-J", "-o", "NAME,LABEL,SIZE,RM,TRAN,MOUNTPOINT,FSTYPE"],
@@ -311,7 +363,12 @@ def devices():
 
     for dev in tree.get("blockdevices", []):
         walk(dev, False)
+    return found
 
+
+@app.get("/api/devices")
+def devices():
+    found = list_removable_devices()
     if DEMO_ROOT.exists():                       # fake drives for testing
         for d in sorted(p for p in DEMO_ROOT.iterdir() if p.is_dir()):
             found.append({"name": d.name, "label": f"DEMO {d.name}", "size": None,
@@ -319,24 +376,99 @@ def devices():
     return jsonify({"devices": found})
 
 
-@app.post("/api/scan")
-def scan_endpoint():
-    body = request.get_json(silent=True) or {}
+def device_watcher(interval=2.0):
+    """Background thread: checks every 2 s which USB drives are mounted and writes
+    DEVICE_INSERTED / DEVICE_REMOVED to the audit log when that list changes."""
+    import time
+    known = {d["mountpoint"]: d for d in list_removable_devices()}
+    while True:
+        time.sleep(interval)
+        current = {d["mountpoint"]: d for d in list_removable_devices()}
+        for mp, d in current.items():
+            if mp not in known:
+                audit("DEVICE_INSERTED", f"USB drive inserted: {d['label']} ({d['size']}) at {mp}")
+        for mp, d in known.items():
+            if mp not in current:
+                audit("DEVICE_REMOVED", f"USB drive removed: {d['label']} (was at {mp})")
+        known = current
+
+
+def check_source(body):
+    """Validate the folder the dashboard wants scanned. Returns (path, error_response)."""
     raw = body.get("source", "")
     if not raw:
-        return err("Missing 'source' (folder path of the USB).")
+        return None, err("Missing 'source' (folder path of the USB).")
     source = Path(raw).resolve()
     if not source.is_dir():
-        return err(f"'{raw}' is not a folder.")
+        return None, err(f"'{raw}' is not a folder.")
     if not source_allowed(source):
         audit("BLOCKED", f"Refused to scan {source} (outside allowed locations)")
-        return err("That location is not allowed. Only removable-drive mount points can be scanned.", 403)
+        return None, err("That location is not allowed. Only removable-drive mount points can be scanned.", 403)
+    return source, None
+
+
+@app.post("/api/scan")
+def scan_endpoint():
+    """Simple version: waits until the scan is finished, then returns the report."""
+    source, bad = check_source(request.get_json(silent=True) or {})
+    if bad:
+        return bad
     if not _scan_lock.acquire(blocking=False):
         return err("Another scan is already running. Please wait.", 409)
     try:
         return jsonify(run_scan(source))
     finally:
         _scan_lock.release()
+
+
+@app.post("/api/scan/start")
+def scan_start():
+    """Dashboard version: starts the scan in the background and returns at once."""
+    source, bad = check_source(request.get_json(silent=True) or {})
+    if bad:
+        return bad
+    if not _scan_lock.acquire(blocking=False):
+        return err("Another scan is already running. Please wait.", 409)
+    job_id = uuid.uuid4().hex[:12]
+    job = {"job_id": job_id, "state": "running", "phase": "copying", "total": 0,
+           "copied": 0, "scanned": 0, "cancel": False, "scan_id": None, "error": None}
+    JOBS[job_id] = job
+
+    def worker():
+        try:
+            scan = run_scan(source, job)
+            job.update(state="finished", scan_id=scan["scan_id"])
+        except ScanCancelled:
+            job["state"] = "cancelled"
+        except Exception as e:                      # never leave the dashboard hanging
+            job.update(state="error", error=str(e))
+            audit("ERROR", f"Scan failed: {e}")
+        finally:
+            _scan_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"job_id": job_id}), 202
+
+
+@app.get("/api/scan/status/<job_id>")
+def scan_status(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return err("Unknown scan job.", 404)
+    total = job["total"]
+    done = total if job["state"] == "finished" else min(total, (job["copied"] + job["scanned"]) // 2)
+    return jsonify({"state": job["state"], "phase": job["phase"], "done": done, "total": total,
+                    "scan_id": job["scan_id"], "error": job["error"]})
+
+
+@app.post("/api/scan/cancel/<job_id>")
+def scan_cancel(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return err("Unknown scan job.", 404)
+    if job["state"] == "running":
+        job["cancel"] = True
+    return jsonify({"ok": True, "state": job["state"]})
 
 
 @app.get("/api/scans")
@@ -452,5 +584,6 @@ def static_files(filename):
 
 
 if __name__ == "__main__":
+    threading.Thread(target=device_watcher, daemon=True).start()
     print(f"USB Airlock backend running. ClamAV: {clamav_version() or 'NOT FOUND'}")
     app.run(host="0.0.0.0", port=5000, debug=False)
