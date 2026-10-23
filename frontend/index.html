@@ -1,107 +1,225 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<title>USB Airlock - reference dashboard</title>
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- REFERENCE PAGE written by the backend dev so the API can be tested end to end.
-     Friend: replace/restyle freely, but keep the fetch() calls and the textContent rule. -->
+<title>Pen Drive Security Scanner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
-  body{font-family:system-ui,sans-serif;margin:24px;background:#0f1419;color:#e6e6e6}
-  h1{margin:0 0 4px} .sub{color:#8b98a5;margin-bottom:16px}
-  button,select{padding:8px 14px;border-radius:6px;border:1px solid #333;background:#1c2530;color:#e6e6e6;cursor:pointer}
-  button:hover{background:#26323f} button.primary{background:#1d6fd8;border-color:#1d6fd8}
-  table{border-collapse:collapse;width:100%;margin:16px 0} th,td{padding:8px;border-bottom:1px solid #263040;text-align:left;vertical-align:top}
-  .badge{padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700;color:#fff}
-  .LOW{background:#2e9e5b}.MEDIUM{background:#d99a1e}.HIGH{background:#d03b3b}
-  .hash{font-family:monospace;font-size:11px;color:#8b98a5} .warn{background:#4a3a10;padding:8px 12px;border-radius:6px;margin:8px 0}
-  .msg{margin:8px 0;color:#9ad0ff} #log div{font-size:13px;padding:3px 0;border-bottom:1px solid #1c2530}
+  :root {
+    --bg: #f3f6f4;
+    --ink: #1b2a27;
+    --muted: #5d6e69;
+    --track: #dde5e1;
+    --brand: #1f7a68;
+    --brand-ink: #ffffff;
+    --safe: #2e8b57;
+    --warn: #c9402f;
+    --radius: 999px;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121a18; --ink: #e8f0ed; --muted: #9bb0aa; --track: #263330;
+      --brand: #46b89f; --brand-ink: #0c1412; --safe: #5fcf8d; --warn: #ff7b6b;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Nunito", system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+  }
+  main { width: 100%; max-width: 420px; text-align: center; }
+
+  .drive { position: relative; width: 220px; height: 220px; margin: 0 auto 28px; }
+  .drive svg { width: 100%; height: 100%; overflow: visible; }
+  .ring-track { fill: none; stroke: var(--track); stroke-width: 8; }
+  .ring { fill: none; stroke: var(--brand); stroke-width: 8; stroke-linecap: round;
+          stroke-dasharray: 553; stroke-dashoffset: 553;
+          transform: rotate(-90deg); transform-origin: 110px 110px;
+          transition: stroke-dashoffset .4s ease, stroke .3s; }
+  [data-state="waiting"] .ring { stroke-dasharray: 6 14; stroke-dashoffset: 0; stroke: var(--muted);
+          animation: spin 40s linear infinite; }
+  [data-state="clean"] .ring { stroke: var(--safe); stroke-dashoffset: 0; }
+  [data-state="threats"] .ring { stroke: var(--warn); stroke-dashoffset: 0; }
+  @keyframes spin { to { transform: rotate(270deg); } }
+
+  .usb-body { fill: var(--ink); }
+  .usb-metal { fill: var(--muted); }
+  .usb-hole { fill: var(--bg); }
+  [data-state="waiting"] .usb { opacity: .35; }
+  .usb { transition: opacity .3s; }
+
+  .badge { position: absolute; right: 18px; bottom: 18px; width: 52px; height: 52px; border-radius: 50%;
+           display: none; place-items: center; color: #fff; font-size: 26px; font-weight: 800; }
+  [data-state="clean"] .badge { display: grid; background: var(--safe); }
+  [data-state="threats"] .badge { display: grid; background: var(--warn); }
+
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 10px; font-weight: 800; letter-spacing: -.01em; }
+  .sub { color: var(--muted); font-size: 1.05rem; line-height: 1.5; margin: 0 auto 28px; max-width: 34ch; }
+
+  .threats { list-style: none; padding: 0; margin: -8px auto 28px; max-width: 34ch; text-align: left; display: none; }
+  [data-state="threats"] .threats { display: block; }
+  .threats li { padding: 10px 14px; border-radius: 12px; background: var(--track); margin-bottom: 8px;
+                font-size: .95rem; word-break: break-all; }
+  .threats b { color: var(--warn); font-weight: 800; }
+
+  button.main {
+    width: 100%; padding: 18px 24px; border: 0; border-radius: var(--radius);
+    background: var(--brand); color: var(--brand-ink);
+    font: 800 1.1rem "Nunito", system-ui, sans-serif; cursor: pointer;
+    transition: transform .1s, opacity .2s;
+  }
+  button.main:hover:not(:disabled) { transform: translateY(-1px); }
+  button.main:active:not(:disabled) { transform: translateY(1px); }
+  button.main:disabled { opacity: .4; cursor: not-allowed; }
+  button.main.quiet { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 2px var(--track); }
+  button:focus-visible, .link:focus-visible { outline: 3px solid var(--brand); outline-offset: 3px; }
+
+  .foot { margin-top: 28px; color: var(--muted); font-size: .9rem; line-height: 1.5; }
+  .link { background: none; border: 0; padding: 0; color: var(--brand); font: inherit; font-weight: 600;
+          text-decoration: underline; cursor: pointer; }
+  [data-state]:not([data-state="waiting"]) .demo { display: none; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .ring, button.main { transition: none; }
+    [data-state="waiting"] .ring { animation: none; }
+  }
 </style>
 </head>
 <body>
-<h1>USB Airlock</h1><div class="sub">Inspect before you trust.</div>
+<main data-state="waiting" id="app">
 
-<select id="device"></select>
-<button class="primary" id="scanBtn">Scan drive</button>
-<button id="refreshBtn">Refresh drives</button>
-<div id="status" class="msg"></div><div id="warn"></div>
+  <div class="drive">
+    <svg viewBox="0 0 220 220" aria-hidden="true">
+      <circle class="ring-track" cx="110" cy="110" r="88"/>
+      <circle class="ring" id="ring" cx="110" cy="110" r="88"/>
+      <g class="usb">
+        <rect class="usb-metal" x="92" y="60" width="36" height="34" rx="4"/>
+        <rect class="usb-hole" x="99" y="68" width="6" height="9" rx="2"/>
+        <rect class="usb-hole" x="115" y="68" width="6" height="9" rx="2"/>
+        <rect class="usb-body" x="82" y="92" width="56" height="70" rx="12"/>
+        <circle class="usb-hole" cx="110" cy="146" r="5"/>
+      </g>
+    </svg>
+    <div class="badge" id="badge" aria-hidden="true"></div>
+  </div>
 
-<table id="tbl" hidden>
-  <thead><tr><th><input type="checkbox" id="all"></th><th>File</th><th>Risk</th><th>Why</th><th>SHA-256</th></tr></thead>
-  <tbody></tbody>
-</table>
-<div id="actions" hidden>
-  <button class="primary" id="approveBtn">Approve selected &rarr; Trusted</button>
-  <button id="keepBtn">Keep selected in Quarantine</button>
-</div>
+  <div aria-live="polite">
+    <h1 id="title">Plug in a USB drive</h1>
+    <p class="sub" id="sub">We’ll spot it automatically. Nothing on the drive is opened on your computer.</p>
+  </div>
 
-<h3>Audit log</h3><div id="log"></div>
+  <ul class="threats" id="threats"></ul>
+
+  <button class="main" id="action" disabled>Scan drive</button>
+
+  <p class="foot">
+    Your drive is checked inside an isolated virtual machine using ClamAV, so anything risky stays contained.
+    <span class="demo"><br><button class="link" id="demo">Preview with a demo drive</button></span>
+  </p>
+</main>
 
 <script>
-const API = "";            // same address as the backend. If the page is opened from elsewhere: "http://localhost:5000"
-let scan = null;
+/* ------------------------------------------------------------------
+   BACKEND HOOKS: call these from your existing detection/scan code.
+     driveConnected({ name: "SANDISK", size: "16 GB" })
+     scanProgress(filesDone, filesTotal)
+     scanFinished(["Win.Trojan.Agent-123", "autorun.inf"])   // [] = clean
+     driveRemoved()
+   And set these to start/stop the real scan:
+     window.requestScan = () => { ... }
+     window.requestCancel = () => { ... }
+------------------------------------------------------------------- */
+const app = document.getElementById("app");
 const $ = id => document.getElementById(id);
+const CIRC = 553;
+let drive = null, total = 0, demoTimer = null;
 
-async function api(path, body) {
-  const res = await fetch(API + path, body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {});
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || res.statusText);
-  return data;
-}
-function cell(tr, text, cls) { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); return td; }
-
-async function loadDevices() {
-  const {devices} = await api("/api/devices");
-  $("device").innerHTML = "";
-  devices.forEach(d => { const o = document.createElement("option"); o.value = d.mountpoint; o.textContent = `${d.label} (${d.mountpoint})`; $("device").appendChild(o); });
-  if (!devices.length) $("status").textContent = "No drives found. Plug in a USB (attached to the VM) or run make_test_drives.py.";
+function render(state, title, sub, button, opts = {}) {
+  app.dataset.state = state;
+  $("title").textContent = title;
+  $("sub").textContent = sub;
+  const b = $("action");
+  b.textContent = button;
+  b.disabled = !!opts.disabled;
+  b.classList.toggle("quiet", !!opts.quiet);
+  $("badge").textContent = state === "clean" ? "✓" : state === "threats" ? "!" : "";
 }
 
-async function doScan() {
-  $("status").textContent = "Scanning... ClamAV needs 10-30 seconds to start, please wait.";
-  $("scanBtn").disabled = true;
-  try { scan = await api("/api/scan", {source: $("device").value}); render(); $("status").textContent = `Scan complete: ${scan.summary.total} files.`; }
-  catch (e) { $("status").textContent = "Error: " + e.message; }
-  $("scanBtn").disabled = false; loadLog();
+function driveRemoved() {
+  clearInterval(demoTimer); drive = null;
+  $("ring").style.strokeDashoffset = "";
+  render("waiting", "Plug in a USB drive",
+    "We’ll spot it automatically. Nothing on the drive is opened on your computer.",
+    "Scan drive", { disabled: true });
 }
 
-function render() {
-  $("warn").innerHTML = "";
-  if (scan.clamav_status !== "ok") { const w = document.createElement("div"); w.className = "warn"; w.textContent = "ClamAV did not run (" + scan.clamav_message + ") - results are rule-based only."; $("warn").appendChild(w); }
-  const body = document.querySelector("#tbl tbody"); body.innerHTML = "";
-  scan.files.forEach(f => {
-    const tr = document.createElement("tr");
-    const c = document.createElement("td"); const cb = document.createElement("input"); cb.type = "checkbox"; cb.value = f.id; cb.disabled = f.status === "approved"; c.appendChild(cb); tr.appendChild(c);
-    cell(tr, f.rel_path + (f.status === "approved" ? "  (approved)" : ""));
-    const r = cell(tr, ""); const b = document.createElement("span"); b.className = "badge " + f.risk_level; b.textContent = f.risk_level + " (" + f.risk_score + ")"; r.appendChild(b);
-    cell(tr, f.explanation);
-    cell(tr, f.sha256 ? f.sha256.slice(0, 16) + "..." : "-", "hash");
-    body.appendChild(tr);
-  });
-  $("tbl").hidden = false; $("actions").hidden = false;
+function driveConnected(info) {
+  drive = info;
+  $("ring").style.strokeDashoffset = CIRC;
+  render("ready", `${info.name} is ready`, `${info.size} drive detected. Ready when you are.`, "Scan this drive");
 }
 
-const selected = () => [...document.querySelectorAll("#tbl tbody input:checked")].map(x => x.value);
-
-async function act(path) {
-  const ids = selected(); if (!ids.length) { $("status").textContent = "Select at least one file."; return; }
-  try {
-    const out = await api(path, {scan_id: scan.scan_id, file_ids: ids});
-    $("status").textContent = out.results.map(r => `${r.name}: ${r.message}`).join("  |  ");
-    scan = await api("/api/scans/" + scan.scan_id); render();
-  } catch (e) { $("status").textContent = "Error: " + e.message; }
-  loadLog();
+function scanProgress(done, all) {
+  total = all;
+  $("ring").style.strokeDashoffset = CIRC * (1 - done / all);
+  render("scanning", "Checking your drive",
+    `${done.toLocaleString()} of ${all.toLocaleString()} files checked`, "Cancel scan", { quiet: true });
 }
 
-async function loadLog() {
-  const {entries} = await api("/api/audit?limit=30"); $("log").innerHTML = "";
-  entries.forEach(e => { const d = document.createElement("div"); d.textContent = `${e.time}  [${e.event}]  ${e.message}`; $("log").appendChild(d); });
+function scanFinished(threats) {
+  const list = $("threats");
+  list.innerHTML = "";
+  if (threats.length === 0) {
+    render("clean", "All clear",
+      `No threats found in ${total.toLocaleString()} files. This drive is safe to use.`, "Scan another drive", { quiet: true });
+  } else {
+    threats.forEach(t => {
+      const li = document.createElement("li");
+      li.innerHTML = "<b>Found:</b> ";
+      li.append(document.createTextNode(t));
+      list.appendChild(li);
+    });
+    const n = threats.length;
+    render("threats", n === 1 ? "1 threat found" : `${n} threats found`,
+      "Don’t open this drive on your computer. Eject it or clean it before using it.", "Scan again", { quiet: true });
+  }
 }
 
-$("scanBtn").onclick = doScan; $("refreshBtn").onclick = loadDevices;
-$("approveBtn").onclick = () => act("/api/approve"); $("keepBtn").onclick = () => act("/api/quarantine");
-$("all").onchange = e => document.querySelectorAll("#tbl tbody input:not(:disabled)").forEach(x => x.checked = e.target.checked);
-loadDevices(); loadLog();
+/* Button behaviour */
+$("action").addEventListener("click", () => {
+  const s = app.dataset.state;
+  if (s === "ready" || s === "clean" || s === "threats") {
+    if (s !== "ready" && !drive) return driveRemoved();
+    $("threats").innerHTML = "";
+    scanProgress(0, total || 1);
+    window.requestScan ? window.requestScan() : demoScan();
+  } else if (s === "scanning") {
+    clearInterval(demoTimer);
+    window.requestCancel && window.requestCancel();
+    driveConnected(drive);
+  }
+});
+
+/* Demo (delete when your backend is wired up) */
+function demoScan() {
+  let done = 0; const all = 1840;
+  demoTimer = setInterval(() => {
+    done = Math.min(all, done + 61);
+    scanProgress(done, all);
+    if (done === all) { clearInterval(demoTimer); scanFinished([]); }
+  }, 120);
+}
+$("demo").addEventListener("click", () => driveConnected({ name: "SANDISK", size: "16 GB" }));
 </script>
 </body>
 </html>
