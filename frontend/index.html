@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>USB Airlock - reference dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- REFERENCE PAGE written by the backend dev so the API can be tested end to end.
+     Friend: replace/restyle freely, but keep the fetch() calls and the textContent rule. -->
+<style>
+  body{font-family:system-ui,sans-serif;margin:24px;background:#0f1419;color:#e6e6e6}
+  h1{margin:0 0 4px} .sub{color:#8b98a5;margin-bottom:16px}
+  button,select{padding:8px 14px;border-radius:6px;border:1px solid #333;background:#1c2530;color:#e6e6e6;cursor:pointer}
+  button:hover{background:#26323f} button.primary{background:#1d6fd8;border-color:#1d6fd8}
+  table{border-collapse:collapse;width:100%;margin:16px 0} th,td{padding:8px;border-bottom:1px solid #263040;text-align:left;vertical-align:top}
+  .badge{padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700;color:#fff}
+  .LOW{background:#2e9e5b}.MEDIUM{background:#d99a1e}.HIGH{background:#d03b3b}
+  .hash{font-family:monospace;font-size:11px;color:#8b98a5} .warn{background:#4a3a10;padding:8px 12px;border-radius:6px;margin:8px 0}
+  .msg{margin:8px 0;color:#9ad0ff} #log div{font-size:13px;padding:3px 0;border-bottom:1px solid #1c2530}
+</style>
+</head>
+<body>
+<h1>USB Airlock</h1><div class="sub">Inspect before you trust.</div>
+
+<select id="device"></select>
+<button class="primary" id="scanBtn">Scan drive</button>
+<button id="refreshBtn">Refresh drives</button>
+<div id="status" class="msg"></div><div id="warn"></div>
+
+<table id="tbl" hidden>
+  <thead><tr><th><input type="checkbox" id="all"></th><th>File</th><th>Risk</th><th>Why</th><th>SHA-256</th></tr></thead>
+  <tbody></tbody>
+</table>
+<div id="actions" hidden>
+  <button class="primary" id="approveBtn">Approve selected &rarr; Trusted</button>
+  <button id="keepBtn">Keep selected in Quarantine</button>
+</div>
+
+<h3>Audit log</h3><div id="log"></div>
+
+<script>
+const API = "";            // same address as the backend. If the page is opened from elsewhere: "http://localhost:5000"
+let scan = null;
+const $ = id => document.getElementById(id);
+
+async function api(path, body) {
+  const res = await fetch(API + path, body ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)} : {});
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+function cell(tr, text, cls) { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); return td; }
+
+async function loadDevices() {
+  const {devices} = await api("/api/devices");
+  $("device").innerHTML = "";
+  devices.forEach(d => { const o = document.createElement("option"); o.value = d.mountpoint; o.textContent = `${d.label} (${d.mountpoint})`; $("device").appendChild(o); });
+  if (!devices.length) $("status").textContent = "No drives found. Plug in a USB (attached to the VM) or run make_test_drives.py.";
+}
+
+async function doScan() {
+  $("status").textContent = "Scanning... ClamAV needs 10-30 seconds to start, please wait.";
+  $("scanBtn").disabled = true;
+  try { scan = await api("/api/scan", {source: $("device").value}); render(); $("status").textContent = `Scan complete: ${scan.summary.total} files.`; }
+  catch (e) { $("status").textContent = "Error: " + e.message; }
+  $("scanBtn").disabled = false; loadLog();
+}
+
+function render() {
+  $("warn").innerHTML = "";
+  if (scan.clamav_status !== "ok") { const w = document.createElement("div"); w.className = "warn"; w.textContent = "ClamAV did not run (" + scan.clamav_message + ") - results are rule-based only."; $("warn").appendChild(w); }
+  const body = document.querySelector("#tbl tbody"); body.innerHTML = "";
+  scan.files.forEach(f => {
+    const tr = document.createElement("tr");
+    const c = document.createElement("td"); const cb = document.createElement("input"); cb.type = "checkbox"; cb.value = f.id; cb.disabled = f.status === "approved"; c.appendChild(cb); tr.appendChild(c);
+    cell(tr, f.rel_path + (f.status === "approved" ? "  (approved)" : ""));
+    const r = cell(tr, ""); const b = document.createElement("span"); b.className = "badge " + f.risk_level; b.textContent = f.risk_level + " (" + f.risk_score + ")"; r.appendChild(b);
+    cell(tr, f.explanation);
+    cell(tr, f.sha256 ? f.sha256.slice(0, 16) + "..." : "-", "hash");
+    body.appendChild(tr);
+  });
+  $("tbl").hidden = false; $("actions").hidden = false;
+}
+
+const selected = () => [...document.querySelectorAll("#tbl tbody input:checked")].map(x => x.value);
+
+async function act(path) {
+  const ids = selected(); if (!ids.length) { $("status").textContent = "Select at least one file."; return; }
+  try {
+    const out = await api(path, {scan_id: scan.scan_id, file_ids: ids});
+    $("status").textContent = out.results.map(r => `${r.name}: ${r.message}`).join("  |  ");
+    scan = await api("/api/scans/" + scan.scan_id); render();
+  } catch (e) { $("status").textContent = "Error: " + e.message; }
+  loadLog();
+}
+
+async function loadLog() {
+  const {entries} = await api("/api/audit?limit=30"); $("log").innerHTML = "";
+  entries.forEach(e => { const d = document.createElement("div"); d.textContent = `${e.time}  [${e.event}]  ${e.message}`; $("log").appendChild(d); });
+}
+
+$("scanBtn").onclick = doScan; $("refreshBtn").onclick = loadDevices;
+$("approveBtn").onclick = () => act("/api/approve"); $("keepBtn").onclick = () => act("/api/quarantine");
+$("all").onchange = e => document.querySelectorAll("#tbl tbody input:not(:disabled)").forEach(x => x.checked = e.target.checked);
+loadDevices(); loadLog();
+</script>
+</body>
+</html>
